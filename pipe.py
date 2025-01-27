@@ -1,40 +1,59 @@
-# LLM 기본 파이프라인 선언 
-from langchain.llms import OpenAI
 from langchain.pipelines import TextPipeline
+import transformers
+import torch
+from transfomers import AutoTokenizer
+from torch import cuda, bfloat16
 
-# Step 1: Install LangChain
-# You can install LangChain via pip if you haven't already
-# pip install langchain
+from langchain.chat_models import ChatOpenAI
+from langchain.document_loaders import UnstructuredFileLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings, CacheBackedEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.storage import LocalFileStore
+from langchain.chains import RetrievalQA
 
-# Step 2: Define a function to read content from a .txt file
-def read_txt_file(file_path):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        content = file.read()
-    return content
-
-# Step 3: Create a text-generation pipeline using LangChain
-class TextGeneratePipeline(TextPipeline):
-    def __init__(self, model_name='gpt-3.5-turbo'):
-        self.llm = OpenAI(model_name=model_name)
+def load_model():
+    model_name = 'microsoft/phi-4'
+    device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
     
-    def generate_text(self, input_text):
-        response = self.llm(input_text)
-        return response['choices'][0]['text']
+    bnb_config = transformers.BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type='nf4',
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=bfloat16
+    )
 
-# Example usage
-if __name__ == "__main__":
-    # Define your .txt file path
-    file_path = 'path/to/your/textfile.txt'
+    model_config = transformers.AutoConfig.from_pretrained(model_name, trust_remote_code = True)
+    model = transformers.AutoModelForCausalLM.from_pretrained(model_name, config=model_config, trust_remote_code = True, bnb_config=bnb_config)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code = True)
 
-    # Read the content from the .txt file
-    input_text = read_txt_file(file_path)
+    model = model.to(device)
+    tokenizer = tokenizer.to(device)
 
-    # Initialize the text-generation pipeline
-    pipeline = TextGeneratePipeline()
+    return model, tokenizer
 
-    # Generate text based on the input text
-    generated_text = pipeline.generate_text(input_text)
+def rag_qa(model, prompt):
+    rag_file = 'notice.txt'
+    data_loader = UnstructuredFileLoader(rag_file)
+    cache_dir = LocalFileStore('./cache/')
 
-    # Print the generated text
-    print("Generated Text:")
-    print(generated_text)
+    splitter = CharacterTextSplitter.from_tiktoken_encoder(
+        separator="\n", 
+        chunk_size=500,
+        chunk_overlap=50
+    )
+
+    docs = data_loader.load_and_split(text_splitter=splitter)
+    embeddings = OpenAIEmbeddings()
+    cached_embeddings = CacheBackedEmbeddings.from_bytes_store(embeddings, cache_dir)
+
+    vectorstore = Chroma.from_documents(docs, cached_embeddings)
+    retriever = vectorstore.as_retriever()
+
+    chain = RetrievalQA.from_chain_type(
+    llm=model,
+    chain_type="map_reduce",
+    retriever=retriever,
+    )
+
+    return chain.run(prompt)
